@@ -250,6 +250,9 @@ typedef struct _NVContext
     uint32_t            encNeedMoreInputStreak;
     uint32_t            encOutputFrameCount;
     uint32_t            encLastHealthLogFrame;
+    uint64_t            encPts;
+    uint32_t            encPtsFrameRateNum;
+    uint32_t            encPtsFrameRateDen;
 } NVContext;
 
 typedef struct

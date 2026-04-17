@@ -88,7 +88,7 @@ static int g_disableDecoder = 0;
 
 static int g_encStrictMode = 0;
 static uint32_t g_encForceIdrEvery = 0;
-static uint32_t g_encStartupIdrFrames = 4;
+static uint32_t g_encStartupIdrFrames = 1;
 static uint32_t g_encReconfigureMinMs = 800;
 static int g_encVisibleReconfigure = 0;
 static int g_warnedVp9Av1NoRtformat = 0;
@@ -918,6 +918,9 @@ static void nvencSetFrameRate(NVContext *nvCtx, uint32_t fpsNum,
   changed |= setU32IfChanged(&nvCtx->encInitParams.frameRateDen, fpsDen);
   if (changed) {
     nvCtx->encNeedsReconfigure = 1;
+    nvCtx->encPtsFrameRateNum = fpsNum;
+    nvCtx->encPtsFrameRateDen = fpsDen;
+    LOG("ENC set framerate %u/%u", fpsNum, fpsDen);
   }
 }
 
@@ -2054,7 +2057,7 @@ static VAStatus nvCreateContext(VADriverContextP ctx, VAConfigID config_id,
     nvCtx->encConfig = presetConfig.presetCfg;
     nvCtx->encConfig.version = NV_ENC_CONFIG_VER;
     nvCtx->encConfig.profileGUID = nvCtx->encProfileGuid;
-    nvCtx->encConfig.gopLength = 120;
+    nvCtx->encConfig.gopLength = 60;
     nvCtx->encConfig.frameIntervalP = 1;
     nvCtx->encConfig.rcParams.version = NV_ENC_RC_PARAMS_VER;
     nvCtx->encConfig.rcParams.enableLookahead = 0;
@@ -2124,6 +2127,13 @@ static VAStatus nvCreateContext(VADriverContextP ctx, VAConfigID config_id,
     nvCtx->encInitParams.darHeight = picture_height;
     nvCtx->encInitParams.frameRateNum = 30;
     nvCtx->encInitParams.frameRateDen = 1;
+    nvCtx->encPts = 0;
+    nvCtx->encPtsFrameRateNum = nvCtx->encInitParams.frameRateNum
+                                    ? nvCtx->encInitParams.frameRateNum
+                                    : 30;
+    nvCtx->encPtsFrameRateDen = nvCtx->encInitParams.frameRateDen
+                                    ? nvCtx->encInitParams.frameRateDen
+                                    : 1;
     nvCtx->encInitParams.enableEncodeAsync = 0;
     nvCtx->encInitParams.enablePTD = 1;
     nvCtx->encInitParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
@@ -2485,66 +2495,44 @@ static VAStatus nvMapBuffer(VADriverContextP ctx, VABufferID buf_id, /* in */
   return VA_STATUS_SUCCESS;
 }
 
-static VAStatus nvUnmapBuffer(VADriverContextP ctx, VABufferID buf_id /* in */
-) {
+static VAStatus nvUnmapBuffer(VADriverContextP ctx, VABufferID buf_id) {
   NVDriver *drv = (NVDriver *)ctx->pDriverData;
   NVBuffer *buf = (NVBuffer *)getObjectPtr(drv, OBJECT_TYPE_BUFFER, buf_id);
   if (buf == NULL) {
     return VA_STATUS_ERROR_INVALID_BUFFER;
   }
-  if (buf->bufferType == VAImageBufferType &&
-      buf->surfaceId != VA_INVALID_SURFACE) {
+
+  if (buf->surfaceId != VA_INVALID_SURFACE) {
     NVSurface *surf =
         (NVSurface *)getObjectPtr(drv, OBJECT_TYPE_SURFACE, buf->surfaceId);
     if (surf != NULL && ensureSurfaceHostBuffer(surf)) {
-      int strictCommitted = 0;
-      if (g_encStrictMode && buf->ptr != NULL && buf->ownsPtr) {
+      /* If this buffer owns a shadow copy, commit it now. */
+      if ((buf->commitOnUnmap || (g_encStrictMode && buf->ownsPtr)) &&
+          buf->ptr != NULL && buf->ptr != surf->hostData) {
         size_t copy = buf->size;
         if (copy > surf->hostTotalSize) {
           copy = surf->hostTotalSize;
         }
-        pthread_mutex_lock(&surf->mutex);
+        if (!buf->mappedSurfaceLock) {
+          pthread_mutex_lock(&surf->mutex);
+        }
         memcpy(surf->hostData, buf->ptr, copy);
-        strictCommitted = 1;
       } else if (!buf->mappedSurfaceLock) {
         pthread_mutex_lock(&surf->mutex);
       }
+
       surf->contentX = 0;
       surf->contentY = 0;
       surf->contentWidth = surf->width;
       surf->contentHeight = surf->height;
       surf->contentValid = 1;
       surf->status = VASurfaceReady;
-      if (strictCommitted) {
-        pthread_mutex_unlock(&surf->mutex);
-      } else if (buf->mappedSurfaceLock) {
-        pthread_mutex_unlock(&surf->mutex);
-        buf->mappedSurfaceLock = 0;
-      } else {
-        pthread_mutex_unlock(&surf->mutex);
-      }
-    }
-  }
-  if (buf->commitOnUnmap && buf->surfaceId != VA_INVALID_SURFACE &&
-      buf->ptr != NULL) {
-    NVSurface *surf =
-        (NVSurface *)getObjectPtr(drv, OBJECT_TYPE_SURFACE, buf->surfaceId);
-    if (surf != NULL && ensureSurfaceHostBuffer(surf)) {
-      size_t copy = buf->size;
-      if (copy > surf->hostTotalSize) {
-        copy = surf->hostTotalSize;
-      }
-      pthread_mutex_lock(&surf->mutex);
-      memcpy(surf->hostData, buf->ptr, copy);
-      surf->contentX = 0;
-      surf->contentY = 0;
-      surf->contentWidth = surf->width;
-      surf->contentHeight = surf->height;
-      surf->contentValid = 1;
-      surf->status = VASurfaceReady;
+
       pthread_mutex_unlock(&surf->mutex);
+      buf->mappedSurfaceLock = 0;
     }
   }
+
   return VA_STATUS_SUCCESS;
 }
 
@@ -2605,7 +2593,7 @@ static VAStatus nvBeginPicture(VADriverContextP ctx, VAContextID context,
     surface->contentY = 0;
     surface->contentWidth = surface->width;
     surface->contentHeight = surface->height;
-    surface->contentValid = 0;
+    surface->contentValid = 1;
     surface->status = VASurfaceRendering;
     return VA_STATUS_SUCCESS;
   }
@@ -2644,6 +2632,8 @@ static VAStatus nvBeginPicture(VADriverContextP ctx, VAContextID context,
   if (nvCtx->codec != NULL && nvCtx->codec->beginPicture != NULL) {
     nvCtx->codec->beginPicture(nvCtx);
   }
+
+  LOG("ENC begin frame=%u surface=%u", nvCtx->encFrameNum, render_target);
 
   return VA_STATUS_SUCCESS;
 }
@@ -2713,9 +2703,10 @@ static VAStatus nvRenderPicture(VADriverContextP ctx, VAContextID context,
               nvCtx->encHasCodedBuf = 1;
             }
           }
-          if (pic->pic_fields.bits.idr_pic_flag) {
+          /*if (pic->pic_fields.bits.idr_pic_flag && nvCtx->encFrameNum == 0) {
             nvCtx->encForceIdr = 1;
-          }
+          }*/
+          (void)pic;
         } else if (nvCtx->encIsHevc && buf->ptr != NULL &&
                    buf->size >= sizeof(VAEncPictureParameterBufferHEVC)) {
           const VAEncPictureParameterBufferHEVC *pic =
@@ -2798,6 +2789,8 @@ static VAStatus nvRenderPicture(VADriverContextP ctx, VAContextID context,
               fpsDen = 1;
             }
             nvencSetFrameRate(nvCtx, fpsNum, fpsDen);
+            LOG("ENC frame rate update: raw=0x%x num=%u den=%u", fr->framerate,
+                fpsNum, fpsDen);
           }
         }
         break;
@@ -2968,6 +2961,25 @@ static VAStatus nvEndPicture(VADriverContextP ctx, VAContextID context) {
     const uint8_t *srcUV = src + surface->hostYSize +
                            ((size_t)(srcY / 2U) * srcPitch) + (size_t)srcX;
 
+    // DEBUG
+    uint64_t srcHash = 1469598103934665603ULL;
+    const uint8_t *srcYDbg = src + ((size_t)srcY * srcPitch) + (size_t)srcX;
+    const uint8_t *srcUVDbg = src + surface->hostYSize +
+                              ((size_t)(srcY / 2U) * srcPitch) + (size_t)srcX;
+
+    for (uint32_t y = 0; y < copyHeight; y++) {
+      srcHash =
+          fnv1a64_append(srcHash, srcYDbg + ((size_t)y * srcPitch), copyWidth);
+    }
+    for (uint32_t y = 0; y < (copyHeight / 2U); y++) {
+      srcHash =
+          fnv1a64_append(srcHash, srcUVDbg + ((size_t)y * srcPitch), copyWidth);
+    }
+
+    LOG("ENC source hash frame=%u hash=%016llx", nvCtx->encFrameNum,
+        (unsigned long long)srcHash);
+    // DEBUG END
+
     if (srcX == 0 && srcY == 0 && copyWidth == encWidth &&
         copyHeight == encHeight && srcPitch == dstPitch) {
       /* Fast path for full-frame copies with matching pitches. */
@@ -3064,7 +3076,18 @@ static VAStatus nvEndPicture(VADriverContextP ctx, VAContextID context) {
     picParams.inputHeight = copyHeight;
     picParams.outputBitstream = outputBuffer;
     picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-    picParams.inputTimeStamp = nvCtx->encFrameNum;
+
+    uint32_t fpsNum =
+        nvCtx->encPtsFrameRateNum ? nvCtx->encPtsFrameRateNum : 30;
+    uint32_t fpsDen = nvCtx->encPtsFrameRateDen ? nvCtx->encPtsFrameRateDen : 1;
+
+    uint64_t frame_duration_us = ((uint64_t)fpsDen * 1000000ULL) / fpsNum;
+    if (frame_duration_us == 0) {
+      frame_duration_us = 1;
+    }
+
+    picParams.inputTimeStamp = nvCtx->encPts;
+    nvCtx->encPts += frame_duration_us;
 
     if (g_encForceIdrEvery > 0 &&
         (nvCtx->encFrameNum % g_encForceIdrEvery) == 0) {
@@ -3074,10 +3097,18 @@ static VAStatus nvEndPicture(VADriverContextP ctx, VAContextID context) {
       nvCtx->encForceIdr = 1;
     }
     if (nvCtx->encForceIdr || nvCtx->encFrameNum == 0) {
-      picParams.encodePicFlags =
-          NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+      picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
       picParams.pictureType = NV_ENC_PIC_TYPE_IDR;
+
+      if (nvCtx->encFrameNum == 0) {
+        picParams.encodePicFlags |= NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+      }
     }
+
+    LOG("ENC submit frame=%u pts=%llu fps=%u/%u size=%ux%u flags=0x%x",
+        nvCtx->encFrameNum, (unsigned long long)picParams.inputTimeStamp,
+        nvCtx->encInitParams.frameRateNum, nvCtx->encInitParams.frameRateDen,
+        picParams.inputWidth, picParams.inputHeight, picParams.encodePicFlags);
 
     nvs = drv->nvencFuncs.nvEncEncodePicture(nvCtx->nvencEncoder, &picParams);
     if (nvs == NV_ENC_ERR_INVALID_PARAM &&
@@ -3174,6 +3205,20 @@ static VAStatus nvEndPicture(VADriverContextP ctx, VAContextID context) {
       surface->status = VASurfaceReady;
       LOG("nvEncLockBitstream failed: %s", nvencStatusStr(nvs));
       return nvencToVaStatus(nvs);
+    } else { // Debug
+      static int _dump_n = 0;
+      if (_dump_n < 10) {
+        char _p[256];
+        snprintf(_p, sizeof(_p), "/tmp/nvenc_frame_%03d.h264", _dump_n);
+        FILE *_f = fopen(_p, "wb");
+        if (_f) {
+          fwrite(lockBS.bitstreamBufferPtr, 1, lockBS.bitstreamSizeInBytes, _f);
+          fclose(_f);
+        }
+        LOG("DUMP frame %d: %u bytes → %s (type=%d)", _dump_n,
+            lockBS.bitstreamSizeInBytes, _p, lockBS.pictureType);
+        _dump_n++;
+      }
     }
 
     size_t copySize = lockBS.bitstreamSizeInBytes;
@@ -3317,6 +3362,17 @@ static VAStatus nvSyncSurface(VADriverContextP ctx, VASurfaceID render_target) {
 
   // LOG("Surface %d resolved (%p)", surface->pictureIdx, surface);
 
+  return VA_STATUS_SUCCESS;
+}
+
+static VAStatus nvSyncBuffer(VADriverContextP ctx, VABufferID buf_id,
+                             uint64_t timeout_ns) {
+  /* Encoding is synchronous in nvEndPicture — the buffer is already ready */
+  NVDriver *drv = (NVDriver *)ctx->pDriverData;
+  NVBuffer *buf = getObjectPtr(drv, OBJECT_TYPE_BUFFER, buf_id);
+  if (buf == NULL) {
+    return VA_STATUS_ERROR_INVALID_BUFFER;
+  }
   return VA_STATUS_SUCCESS;
 }
 
@@ -3475,6 +3531,8 @@ static VAStatus nvDeriveImage(VADriverContextP ctx, VASurfaceID surface,
   Object imageBufferObject =
       allocateObject(drv, OBJECT_TYPE_BUFFER, sizeof(NVBuffer));
   NVBuffer *imageBuffer = (NVBuffer *)imageBufferObject->obj;
+  memset(imageBuffer, 0, sizeof(*imageBuffer));
+
   imageBuffer->bufferType = VAImageBufferType;
   imageBuffer->elements = 1;
   imageBuffer->size = surfaceObj->hostTotalSize;
@@ -3485,6 +3543,8 @@ static VAStatus nvDeriveImage(VADriverContextP ctx, VASurfaceID surface,
 
   Object imageObj = allocateObject(drv, OBJECT_TYPE_IMAGE, sizeof(NVImage));
   NVImage *img = (NVImage *)imageObj->obj;
+  memset(img, 0, sizeof(*img));
+
   img->width = surfaceObj->width;
   img->height = surfaceObj->height;
   img->format = NV_FORMAT_NV12;
@@ -4476,7 +4536,7 @@ __vaDriverInit_1_0(VADriverContextP ctx) {
     appendProfileIfMissing(drv, VAProfileHEVCMain);
     appendProfileIfMissing(drv, VAProfileHEVCMain10);
   }
-
+  ctx->vtable->vaSyncBuffer = nvSyncBuffer;
   *ctx->vtable = vtable;
   return VA_STATUS_SUCCESS;
 }
