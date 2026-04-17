@@ -1,7 +1,11 @@
 #define _GNU_SOURCE
+#include <va/va.h>
 
-#include "vabackend.h"
 #include "backend-common.h"
+#include "vabackend.h"
+
+#include <strings.h>
+#include <unistd.h>
 
 #include <assert.h>
 #include <errno.h>
@@ -85,7 +89,7 @@ static int gpu = -1;
 static enum { EGL, DIRECT } backend = DIRECT;
 static int g_disableDecoder = 0;
 
-#define NVENC_CODED_BUF_SIZE (4 * 1024 * 1024)
+#define NVENC_CODED_BUF_SIZE (16 * 1024 * 1024)
 #define NVENC_PITCH_ALIGN 64
 #define NVENC_HEIGHT_ALIGN 16
 
@@ -1164,6 +1168,32 @@ static VAStatus nvencReconfigureIfNeeded(NVDriver *drv, NVContext *nvCtx) {
       oldHeight != (uint32_t)nvCtx->height) {
     LOG("NVENC reconfigured: %ux%u -> %dx%d", oldWidth, oldHeight, nvCtx->width,
         nvCtx->height);
+    // ---> Recreate I/O buffers at the new resolution for the Fast Path <---
+    nvencDestroyIoBuffers(drv, nvCtx);
+    nvCtx->nvencIoBufferCount = parseEnvU32("NVD_ENC_IO_DEPTH", 1);
+    if (nvCtx->nvencIoBufferCount == 0)
+      nvCtx->nvencIoBufferCount = 1;
+    if (nvCtx->nvencIoBufferCount > NVENC_MAX_IO_BUFFERS)
+      nvCtx->nvencIoBufferCount = NVENC_MAX_IO_BUFFERS;
+
+    for (uint32_t i = 0; i < nvCtx->nvencIoBufferCount; i++) {
+      NV_ENC_CREATE_INPUT_BUFFER createInput;
+      memset(&createInput, 0, sizeof(createInput));
+      createInput.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+      createInput.width = nvCtx->width;
+      createInput.height = nvCtx->height;
+      createInput.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+      drv->nvencFuncs.nvEncCreateInputBuffer(nvCtx->nvencEncoder, &createInput);
+      nvCtx->nvencInputBuffers[i] = createInput.inputBuffer;
+
+      NV_ENC_CREATE_BITSTREAM_BUFFER createBS;
+      memset(&createBS, 0, sizeof(createBS));
+      createBS.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+      drv->nvencFuncs.nvEncCreateBitstreamBuffer(nvCtx->nvencEncoder,
+                                                 &createBS);
+      nvCtx->nvencOutputBuffers[i] = createBS.bitstreamBuffer;
+    }
+    // ---> END <---
   }
   nvCtx->encNeedsReconfigure = 0;
   return VA_STATUS_SUCCESS;
@@ -1458,7 +1488,8 @@ static VAStatus nvGetConfigAttributes(VADriverContextP ctx, VAProfile profile,
                                VA_ENC_PACKED_HEADER_SLICE;
         break;
       case VAConfigAttribEncSliceStructure:
-        attrib_list[i].value = VA_ENC_SLICE_STRUCTURE_ARBITRARY_MACROBLOCKS;
+        // attrib_list[i].value = VA_ENC_SLICE_STRUCTURE_ARBITRARY_MACROBLOCKS;
+        attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
         break;
       default:
         attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
@@ -2165,8 +2196,8 @@ static VAStatus nvCreateContext(VADriverContextP ctx, VAConfigID config_id,
       NV_ENC_CREATE_INPUT_BUFFER createInput;
       memset(&createInput, 0, sizeof(createInput));
       createInput.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
-      createInput.width = MAX_ENCODE_WIDTH;
-      createInput.height = MAX_ENCODE_HEIGHT;
+      createInput.width = picture_width;
+      createInput.height = picture_height;
       createInput.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
 
       nvs = drv->nvencFuncs.nvEncCreateInputBuffer(nvCtx->nvencEncoder,
@@ -2711,10 +2742,9 @@ static VAStatus nvRenderPicture(VADriverContextP ctx, VAContextID context,
               nvCtx->encHasCodedBuf = 1;
             }
           }
-          /*if (pic->pic_fields.bits.idr_pic_flag && nvCtx->encFrameNum == 0) {
+          if (pic->pic_fields.bits.idr_pic_flag) {
             nvCtx->encForceIdr = 1;
-          }*/
-          (void)pic;
+          }
         } else if (nvCtx->encIsHevc && buf->ptr != NULL &&
                    buf->size >= sizeof(VAEncPictureParameterBufferHEVC)) {
           const VAEncPictureParameterBufferHEVC *pic =
@@ -2866,45 +2896,11 @@ static VAStatus nvEndPicture(VADriverContextP ctx, VAContextID context) {
       return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
-    // --- INIZIO FIX: PROACTIVE RECONFIGURE ---
-    uint32_t targetWidth = surface->width;
-    uint32_t targetHeight = surface->height;
-
-    if (nvCtx->encVisibleValid && nvCtx->encVisibleWidth > 0 &&
-        nvCtx->encVisibleHeight > 0) {
-      targetWidth = nvCtx->encVisibleWidth;
-      targetHeight = nvCtx->encVisibleHeight;
-    } else if (surface->contentValid && surface->contentWidth > 0 &&
-               surface->contentHeight > 0) {
-      targetWidth = surface->contentWidth;
-      targetHeight = surface->contentHeight;
-    }
-
-    targetWidth &= ~1U;
-    targetHeight &= ~1U;
-
-    // If the input surface has different dimensions than the NVENC context,
-    // update the parameters before launching the reconfigure.
-    if (targetWidth > 0 && targetHeight > 0 &&
-        (targetWidth != (uint32_t)nvCtx->width ||
-         targetHeight != (uint32_t)nvCtx->height)) {
-      nvCtx->encInitParams.encodeWidth = targetWidth;
-      nvCtx->encInitParams.encodeHeight = targetHeight;
-      nvCtx->encInitParams.darWidth = targetWidth;
-      nvCtx->encInitParams.darHeight = targetHeight;
-      nvCtx->encNeedsReconfigure = 1;
-      LOG("Proactive reconfigure triggered by surface dimension change: %dx%d "
-          "-> %ux%u",
-          nvCtx->width, nvCtx->height, targetWidth, targetHeight);
-    }
-    // --- FINE FIX ---
-
     VAStatus vas = nvencReconfigureIfNeeded(drv, nvCtx);
     if (vas != VA_STATUS_SUCCESS) {
       surface->status = VASurfaceReady;
       return vas;
     }
-
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext),
                              VA_STATUS_ERROR_OPERATION_FAILED);
 
@@ -2995,8 +2991,7 @@ static VAStatus nvEndPicture(VADriverContextP ctx, VAContextID context) {
       srcY = 0;
     }
 
-    uint32_t allocHeight = nvCtx->encInitParams.maxEncodeHeight;
-    uint8_t *dstUV = dst + ((size_t)allocHeight * dstPitch);
+    uint8_t *dstUV = dst + ((size_t)encHeight * dstPitch);
 
     pthread_mutex_lock(&surface->mutex);
     const uint8_t *srcYBase = src + ((size_t)srcY * srcPitch) + (size_t)srcX;
@@ -3114,8 +3109,8 @@ static VAStatus nvEndPicture(VADriverContextP ctx, VAContextID context) {
     picParams.inputBuffer = inputBuffer;
     picParams.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
     picParams.inputPitch = (uint32_t)dstPitch;
-    picParams.inputWidth = copyWidth;
-    picParams.inputHeight = copyHeight;
+    picParams.inputWidth = encWidth;
+    picParams.inputHeight = encHeight;
     picParams.outputBitstream = outputBuffer;
     picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
 
