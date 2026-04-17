@@ -58,6 +58,9 @@
 #endif
 #endif
 
+#define MAX_ENCODE_WIDTH 4096
+#define MAX_ENCODE_HEIGHT 4096
+
 static pid_t nv_gettid(void) {
 #if HAVE_GETTID
   return gettid();
@@ -349,7 +352,7 @@ __attribute__((constructor)) static void init() {
   if (g_encForceIdrEvery > 0) {
     LOG("NVD_ENC_FORCE_IDR_EVERY=%u", g_encForceIdrEvery);
   }
-  g_encStartupIdrFrames = parseEnvU32("NVD_ENC_STARTUP_IDR_FRAMES", 16);
+  g_encStartupIdrFrames = parseEnvU32("NVD_ENC_STARTUP_IDR_FRAMES", 1);
   LOG("NVD_ENC_STARTUP_IDR_FRAMES=%u", g_encStartupIdrFrames);
   g_encReconfigureMinMs = parseEnvU32("NVD_ENC_RECONFIG_MIN_MS", 800);
   LOG("NVD_ENC_RECONFIG_MIN_MS=%u", g_encReconfigureMinMs);
@@ -1450,10 +1453,9 @@ static VAStatus nvGetConfigAttributes(VADriverContextP ctx, VAProfile profile,
         attrib_list[i].value = 8192;
         break;
       case VAConfigAttribEncPackedHeaders:
-        /* Non gestiamo packed headers — NVENC genera SPS/PPS.
-         * Dichiarare NONE evita che Chromium invii header
-         * che verrebbero ignorati. */
-        attrib_list[i].value = VA_ENC_PACKED_HEADER_NONE;
+        attrib_list[i].value = VA_ENC_PACKED_HEADER_SEQUENCE |
+                               VA_ENC_PACKED_HEADER_PICTURE |
+                               VA_ENC_PACKED_HEADER_SLICE;
         break;
       case VAConfigAttribEncSliceStructure:
         attrib_list[i].value = VA_ENC_SLICE_STRUCTURE_ARBITRARY_MACROBLOCKS;
@@ -1988,7 +1990,9 @@ static VAStatus nvCreateContext(VADriverContextP ctx, VAConfigID config_id,
     nvCtx->entrypoint = cfg->entrypoint;
     nvCtx->width = picture_width;
     nvCtx->height = picture_height;
-    nvCtx->encPresetGuid = NV_ENC_PRESET_P4_GUID;
+    nvCtx->encPresetGuid = NV_ENC_PRESET_P1_GUID; // P1: high perf, low lag; as
+                                                  // opposed to the previous P4
+    nvCtx->encInitParams.enablePTD = 0; // Let WebRTC decide when to send frames
     nvCtx->encFrameNum = 0;
     nvCtx->encCurrentSurface = VA_INVALID_SURFACE;
     nvCtx->encCodedBufId = VA_INVALID_ID;
@@ -2057,7 +2061,7 @@ static VAStatus nvCreateContext(VADriverContextP ctx, VAConfigID config_id,
     nvCtx->encConfig = presetConfig.presetCfg;
     nvCtx->encConfig.version = NV_ENC_CONFIG_VER;
     nvCtx->encConfig.profileGUID = nvCtx->encProfileGuid;
-    nvCtx->encConfig.gopLength = 60;
+    nvCtx->encConfig.gopLength = 120; // 2 minutes
     nvCtx->encConfig.frameIntervalP = 1;
     nvCtx->encConfig.rcParams.version = NV_ENC_RC_PARAMS_VER;
     nvCtx->encConfig.rcParams.enableLookahead = 0;
@@ -2069,11 +2073,15 @@ static VAStatus nvCreateContext(VADriverContextP ctx, VAConfigID config_id,
      * VAEncMiscParameterTypeRateControl */
     if (cfg->encodeRCMode & VA_RC_CBR) {
       nvCtx->encConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
-      nvCtx->encConfig.rcParams.averageBitRate = 2000000; // 2 Mbps
-      nvCtx->encConfig.rcParams.maxBitRate = 2000000;
+      nvCtx->encConfig.rcParams.averageBitRate = 2500000; // 2 Mbps
+      nvCtx->encConfig.rcParams.maxBitRate = 2500000;
+      // Enable VBV (Video Buffering Verifier) to avoid peaks
+      nvCtx->encConfig.rcParams.vbvBufferSize = 2500000 / 30; // ~1 frame buffer
+      nvCtx->encConfig.rcParams.vbvInitialDelay =
+          nvCtx->encConfig.rcParams.vbvBufferSize;
     } else if (cfg->encodeRCMode & VA_RC_VBR) {
       nvCtx->encConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
-      nvCtx->encConfig.rcParams.averageBitRate = 2000000;
+      nvCtx->encConfig.rcParams.averageBitRate = 2500000;
       nvCtx->encConfig.rcParams.maxBitRate = 4000000;
     } else if (cfg->encodeRCMode & VA_RC_CQP) {
       nvCtx->encConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CONSTQP;
@@ -2138,8 +2146,8 @@ static VAStatus nvCreateContext(VADriverContextP ctx, VAConfigID config_id,
     nvCtx->encInitParams.enablePTD = 1;
     nvCtx->encInitParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
     nvCtx->encInitParams.encodeConfig = &nvCtx->encConfig;
-    nvCtx->encInitParams.maxEncodeWidth = picture_width;
-    nvCtx->encInitParams.maxEncodeHeight = picture_height;
+    nvCtx->encInitParams.maxEncodeWidth = MAX_ENCODE_WIDTH;
+    nvCtx->encInitParams.maxEncodeHeight = MAX_ENCODE_HEIGHT;
 
     nvs = drv->nvencFuncs.nvEncInitializeEncoder(nvCtx->nvencEncoder,
                                                  &nvCtx->encInitParams);
@@ -2157,8 +2165,8 @@ static VAStatus nvCreateContext(VADriverContextP ctx, VAConfigID config_id,
       NV_ENC_CREATE_INPUT_BUFFER createInput;
       memset(&createInput, 0, sizeof(createInput));
       createInput.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
-      createInput.width = picture_width;
-      createInput.height = picture_height;
+      createInput.width = MAX_ENCODE_WIDTH;
+      createInput.height = MAX_ENCODE_HEIGHT;
       createInput.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
 
       nvs = drv->nvencFuncs.nvEncCreateInputBuffer(nvCtx->nvencEncoder,
@@ -2858,6 +2866,39 @@ static VAStatus nvEndPicture(VADriverContextP ctx, VAContextID context) {
       return VA_STATUS_ERROR_OPERATION_FAILED;
     }
 
+    // --- INIZIO FIX: PROACTIVE RECONFIGURE ---
+    uint32_t targetWidth = surface->width;
+    uint32_t targetHeight = surface->height;
+
+    if (nvCtx->encVisibleValid && nvCtx->encVisibleWidth > 0 &&
+        nvCtx->encVisibleHeight > 0) {
+      targetWidth = nvCtx->encVisibleWidth;
+      targetHeight = nvCtx->encVisibleHeight;
+    } else if (surface->contentValid && surface->contentWidth > 0 &&
+               surface->contentHeight > 0) {
+      targetWidth = surface->contentWidth;
+      targetHeight = surface->contentHeight;
+    }
+
+    targetWidth &= ~1U;
+    targetHeight &= ~1U;
+
+    // If the input surface has different dimensions than the NVENC context,
+    // update the parameters before launching the reconfigure.
+    if (targetWidth > 0 && targetHeight > 0 &&
+        (targetWidth != (uint32_t)nvCtx->width ||
+         targetHeight != (uint32_t)nvCtx->height)) {
+      nvCtx->encInitParams.encodeWidth = targetWidth;
+      nvCtx->encInitParams.encodeHeight = targetHeight;
+      nvCtx->encInitParams.darWidth = targetWidth;
+      nvCtx->encInitParams.darHeight = targetHeight;
+      nvCtx->encNeedsReconfigure = 1;
+      LOG("Proactive reconfigure triggered by surface dimension change: %dx%d "
+          "-> %ux%u",
+          nvCtx->width, nvCtx->height, targetWidth, targetHeight);
+    }
+    // --- FINE FIX ---
+
     VAStatus vas = nvencReconfigureIfNeeded(drv, nvCtx);
     if (vas != VA_STATUS_SUCCESS) {
       surface->status = VASurfaceReady;
@@ -2954,7 +2995,8 @@ static VAStatus nvEndPicture(VADriverContextP ctx, VAContextID context) {
       srcY = 0;
     }
 
-    uint8_t *dstUV = dst + ((size_t)encHeight * dstPitch);
+    uint32_t allocHeight = nvCtx->encInitParams.maxEncodeHeight;
+    uint8_t *dstUV = dst + ((size_t)allocHeight * dstPitch);
 
     pthread_mutex_lock(&surface->mutex);
     const uint8_t *srcYBase = src + ((size_t)srcY * srcPitch) + (size_t)srcX;
