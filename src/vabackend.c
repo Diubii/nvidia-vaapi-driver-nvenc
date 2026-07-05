@@ -899,14 +899,18 @@ static void nvencSetBitrate(NVContext *nvCtx, uint32_t bitsPerSecond) {
   }
   uint32_t avg = bitsPerSecond;
   uint32_t max = bitsPerSecond;
-  if (rc->rateControlMode == NV_ENC_PARAMS_RC_CBR) {
+  /*if (rc->rateControlMode == NV_ENC_PARAMS_RC_CBR) {
     max = bitsPerSecond;
   } else {
     max = rc->maxBitRate < bitsPerSecond ? bitsPerSecond : rc->maxBitRate;
-  }
+  }*/
   int changed = 0;
   changed |= setU32IfChanged(&rc->averageBitRate, avg);
   changed |= setU32IfChanged(&rc->maxBitRate, max);
+  uint32_t vbv = avg / 15; // Limits peaks to ~66ms buffer
+  changed |= setU32IfChanged(&rc->vbvBufferSize, vbv);
+  changed |= setU32IfChanged(&rc->vbvInitialDelay, vbv);
+
   if (changed) {
     nvCtx->encNeedsReconfigure = 1;
   }
@@ -1169,7 +1173,7 @@ static VAStatus nvencReconfigureIfNeeded(NVDriver *drv, NVContext *nvCtx) {
     LOG("NVENC reconfigured: %ux%u -> %dx%d", oldWidth, oldHeight, nvCtx->width,
         nvCtx->height);
     // ---> Recreate I/O buffers at the new resolution for the Fast Path <---
-    nvencDestroyIoBuffers(drv, nvCtx);
+    /*nvencDestroyIoBuffers(drv, nvCtx);
     nvCtx->nvencIoBufferCount = parseEnvU32("NVD_ENC_IO_DEPTH", 1);
     if (nvCtx->nvencIoBufferCount == 0)
       nvCtx->nvencIoBufferCount = 1;
@@ -1192,7 +1196,7 @@ static VAStatus nvencReconfigureIfNeeded(NVDriver *drv, NVContext *nvCtx) {
       drv->nvencFuncs.nvEncCreateBitstreamBuffer(nvCtx->nvencEncoder,
                                                  &createBS);
       nvCtx->nvencOutputBuffers[i] = createBS.bitstreamBuffer;
-    }
+    }*/
     // ---> END <---
   }
   nvCtx->encNeedsReconfigure = 0;
@@ -2079,7 +2083,7 @@ static VAStatus nvCreateContext(VADriverContextP ctx, VAConfigID config_id,
 
     nvs = drv->nvencFuncs.nvEncGetEncodePresetConfigEx(
         nvCtx->nvencEncoder, nvCtx->encCodecGuid, nvCtx->encPresetGuid,
-        NV_ENC_TUNING_INFO_LOW_LATENCY, &presetConfig);
+        NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &presetConfig);
     if (nvs != NV_ENC_SUCCESS) {
       drv->nvencFuncs.nvEncDestroyEncoder(nvCtx->nvencEncoder);
       nvCtx->nvencEncoder = NULL;
@@ -2175,7 +2179,7 @@ static VAStatus nvCreateContext(VADriverContextP ctx, VAConfigID config_id,
                                     : 1;
     nvCtx->encInitParams.enableEncodeAsync = 0;
     nvCtx->encInitParams.enablePTD = 1;
-    nvCtx->encInitParams.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
+    nvCtx->encInitParams.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
     nvCtx->encInitParams.encodeConfig = &nvCtx->encConfig;
     nvCtx->encInitParams.maxEncodeWidth = MAX_ENCODE_WIDTH;
     nvCtx->encInitParams.maxEncodeHeight = MAX_ENCODE_HEIGHT;
@@ -2196,8 +2200,8 @@ static VAStatus nvCreateContext(VADriverContextP ctx, VAConfigID config_id,
       NV_ENC_CREATE_INPUT_BUFFER createInput;
       memset(&createInput, 0, sizeof(createInput));
       createInput.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
-      createInput.width = picture_width;
-      createInput.height = picture_height;
+      createInput.width = MAX_ENCODE_WIDTH;
+      createInput.height = MAX_ENCODE_HEIGHT;
       createInput.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
 
       nvs = drv->nvencFuncs.nvEncCreateInputBuffer(nvCtx->nvencEncoder,
@@ -2435,8 +2439,7 @@ static VAStatus nvCreateBuffer(VADriverContextP ctx,
   buf->mappedSurfaceLock = 0;
 
   if (isEncode && type == VAEncCodedBufferType) {
-    size_t codedCapacity =
-        buf->size > NVENC_CODED_BUF_SIZE ? buf->size : NVENC_CODED_BUF_SIZE;
+    size_t codedCapacity = buf->size; // Use buffer size requested by Chromium
     buf->codedData = calloc(1, sizeof(VACodedBufferSegment) + codedCapacity);
     if (!buf->codedData) {
       deleteObject(drv, bufferObject->id);
@@ -2991,7 +2994,7 @@ static VAStatus nvEndPicture(VADriverContextP ctx, VAContextID context) {
       srcY = 0;
     }
 
-    uint8_t *dstUV = dst + ((size_t)encHeight * dstPitch);
+    uint8_t *dstUV = dst + ((size_t)MAX_ENCODE_HEIGHT * dstPitch);
 
     pthread_mutex_lock(&surface->mutex);
     const uint8_t *srcYBase = src + ((size_t)srcY * srcPitch) + (size_t)srcX;
@@ -3262,7 +3265,11 @@ static VAStatus nvEndPicture(VADriverContextP ctx, VAContextID context) {
     nvCtx->encNeedMoreInputStreak = 0;
     if (copySize > codedBuf->codedCapacity) {
       codedBuf->codedSeg->status = VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK;
-      copySize = codedBuf->codedCapacity;
+      // copySize = codedBuf->codedCapacity;
+      copySize = 0;
+      LOG("WARNING: Bitstream truncated! Frame size (%zu) exceeded Chromium "
+          "buffer (%zu)",
+          (size_t)lockBS.bitstreamSizeInBytes, codedBuf->codedCapacity);
     } else {
       codedBuf->codedSeg->status = 0;
     }

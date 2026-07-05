@@ -19,3 +19,6 @@ build_*/
 *.log
 .vscode/
 compile_commands.json
+CLAUDE.local.md
+.tokensave/
+.claude/
